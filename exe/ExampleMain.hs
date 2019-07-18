@@ -58,7 +58,8 @@ main = do
     ifTop (writeBS "quack!") <|>
     route
       [ ("targets", method GET targetsHandler)
-      , ("parse", method POST $ parseHandler tzs)
+      , ("parse", method GET $ parseGetHandler tzs)
+      , ("parse", method POST $ parsePostHandler tzs)
       ]
 
 -- | Return which languages have which dimensions
@@ -73,8 +74,81 @@ targetsHandler = do
 
 
 -- | Parse some text into the given dimensions
-parseHandler :: HashMap Text TimeZoneSeries -> Snap ()
-parseHandler tzs = do
+parseGetHandler :: HashMap Text TimeZoneSeries -> Snap ()
+parseGetHandler tzs = do
+  modifyResponse $ setHeader "Content-Type" "application/json"
+  t <- getQueryParam "text"
+  l <- getQueryParam "lang"
+  ds <- getQueryParam "dims"
+  tz <- getQueryParam "tz"
+  loc <- getQueryParam "locale"
+  ref <- getQueryParam "reftime"
+  latent <- getQueryParam "latent"
+
+  case t of
+    Nothing -> do
+      modifyResponse $ setResponseStatus 422 "Bad Input"
+      writeBS "Need a 'text' parameter to parse"
+    Just tx -> do
+      let timezone = parseTimeZone tz
+      now <- liftIO $ currentReftime tzs timezone
+      let
+        context = Context
+          { referenceTime = maybe now (parseRefTime timezone) ref
+          , locale = maybe (makeLocale (parseLang l) Nothing) parseLocale loc
+          }
+        options = Options {withLatent = parseLatent latent}
+
+        dimParse = fromMaybe [] $ decode $ LBS.fromStrict $ fromMaybe "" ds
+        dims = mapMaybe parseDimension dimParse
+
+        parsedResult = parse (Text.decodeUtf8 tx) context options dims
+
+      writeLBS $ encode parsedResult
+  where
+    defaultLang = EN
+    defaultLocale = makeLocale defaultLang Nothing
+    defaultTimeZone = "America/Los_Angeles"
+    defaultLatent = False
+
+    parseDimension :: Text -> Maybe (Some Dimension)
+    parseDimension x = fromName x <|> fromCustomName x
+      where
+        fromCustomName :: Text -> Maybe (Some Dimension)
+        fromCustomName name = HashMap.lookup name m
+        m = HashMap.fromList
+          [ -- ("my-dimension", This (CustomDimension MyDimension))
+          ]
+
+    parseTimeZone :: Maybe ByteString -> Text
+    parseTimeZone = maybe defaultTimeZone Text.decodeUtf8
+
+    parseLocale :: ByteString -> Locale
+    parseLocale x = maybe defaultLocale (`makeLocale` mregion) mlang
+      where
+        (mlang, mregion) = case chunks of
+          [a, b] -> (readMaybe a :: Maybe Lang, readMaybe b :: Maybe Region)
+          _      -> (Nothing, Nothing)
+        chunks = map Text.unpack . Text.split (== '_') . Text.toUpper
+          $ Text.decodeUtf8 x
+
+    parseLang :: Maybe ByteString -> Lang
+    parseLang l = fromMaybe defaultLang $ l >>=
+      readMaybe . Text.unpack . Text.toUpper . Text.decodeUtf8
+
+    parseRefTime :: Text -> ByteString -> DucklingTime
+    parseRefTime timezone refTime = makeReftime tzs timezone utcTime
+      where
+        msec = read $ Text.unpack $ Text.decodeUtf8 refTime
+        utcTime = posixSecondsToUTCTime $ fromInteger msec / 1000
+
+    parseLatent :: Maybe ByteString -> Bool
+    parseLatent x = fromMaybe defaultLatent
+      (readMaybe (Text.unpack $ Text.toTitle $ Text.decodeUtf8 $ fromMaybe empty x)::Maybe Bool)
+
+-- | Parse some text into the given dimensions
+parsePostHandler :: HashMap Text TimeZoneSeries -> Snap ()
+parsePostHandler tzs = do
   modifyResponse $ setHeader "Content-Type" "application/json"
   t <- getPostParam "text"
   l <- getPostParam "lang"
